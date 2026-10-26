@@ -1,0 +1,12 @@
+[project]
+name = "FT Studio"
+version = "0.1.0"
+description = "An interactive interface for FlowTangent."
+readme = "README.md"
+requires-python = ">3.12"
+dependencies = [
+    "nicegui",
+    "plotly",
+    "airportsdata",
+    "numpy",
+]

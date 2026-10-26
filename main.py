@@ -1,0 +1,93 @@
+import asyncio
+from nicegui import ui
+
+import pages
+from components.navigation import navigation_header
+from utils.state import app_state, perform_undo, perform_redo
+
+@ui.refreshable
+def router_content():
+    """Dynamically renders the active view and automatically destroys the old DOM."""
+    if app_state['route'] == '/hangar':
+        pages.hangar_ui()
+    elif app_state['route'] == '/simulator':
+        pages.simulator_ui()
+    elif app_state['route'] == '/test_stand':
+        pages.engine_ui()
+    elif app_state['route'] == '/design_space':
+        pages.design_space_ui()
+    else:
+        ui.label('404 - Tool Not Found').classes('text-red-500 text-xl p-8')
+
+@ui.page('/')
+def main_app():
+    # Remove default padding to let the header go edge-to-edge
+    ui.context.client.content.classes('p-0 gap-0')
+
+    ui.add_head_html('''
+    <style>
+        .dark-map-tiles .leaflet-tile-pane {
+            filter: grayscale(100%) invert(100%) sepia(40%) hue-rotate(180deg) saturate(250%) brightness(85%) contrast(110%);
+        }
+        .light-map-tiles .leaflet-tile-pane {
+            filter: grayscale(100%) brightness(115%) contrast(85%);
+        }
+        .q-checkbox__bg { border-radius: 0 !important;}
+    </style>
+    ''')
+
+    header_refresh = None
+    global_progress = None
+    
+    async def switch_page(new_route):
+        if app_state['route'] != new_route:
+            
+            # 1. Start Transition (Show progress, drop opacity to 40%, disable clicking)
+            if global_progress:
+                global_progress.set_visibility(True)
+            
+            content_wrapper.classes(add='opacity-40 pointer-events-none')
+            
+            # Yield to the browser for 100ms so it can actually draw the fade and progress bar
+            await asyncio.sleep(0.1) 
+            
+            # 2. Swap the Route and Rebuild the UI (This happens instantly while hidden)
+            app_state['route'] = new_route
+            router_content.refresh()
+            if header_refresh:
+                header_refresh()
+            
+            # Yield briefly again to ensure the DOM is fully hydrated before lifting the curtain
+            await asyncio.sleep(0.1)
+            
+            # 3. End Transition (Hide progress, restore full opacity, re-enable clicking)
+            content_wrapper.classes(remove='opacity-40 pointer-events-none')
+            if global_progress:
+                global_progress.set_visibility(False)
+
+    callbacks = app_state.setdefault('on_theme_changed', [])
+    if router_content.refresh not in callbacks:
+        callbacks.append(router_content.refresh)
+
+    # Capture both returns from the header
+    header_refresh, global_progress = navigation_header(app_state=app_state, on_nav=switch_page)
+
+    # Use a neutral background here so the fade-out doesn't reveal a blinding white flash underneath
+    is_dark = app_state.get('is_dark', False)
+    bg_color = 'bg-neutral-900' if is_dark else 'bg-gray-200'
+
+    with ui.column().classes(f'w-full h-[calc(100vh-64px)] overflow-hidden p-0 gap-0 {bg_color}'):
+        
+        # --- THE TRANSITION WRAPPER ---
+        # Tailwind handles the smooth fading automatically via 'transition-opacity duration-300'
+        content_wrapper = ui.element('div').classes('w-full h-full transition-opacity duration-300 ease-in-out')
+        
+        with content_wrapper:
+            router_content()
+    
+    # Global Keyboard Shortcuts (Surgically Corrected Syntax)
+    ui.keyboard(on_key=lambda e: perform_undo() if e.key.name == 'z' and e.modifiers.ctrl and e.action.keydown else None)
+    ui.keyboard(on_key=lambda e: perform_redo() if e.key.name == 'y' and e.modifiers.ctrl and e.action.keydown else None)
+
+if __name__ in {"__main__", "__mp_main__"}:
+    ui.run(title="FT Studio", port=8080)
