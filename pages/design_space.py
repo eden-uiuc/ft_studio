@@ -1,17 +1,46 @@
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import zarr
+import string
+
+import flowtangent as ft
+
+from functools import lru_cache
 from plotly.subplots import make_subplots
 from nicegui import ui
 from utils.state import app_state, theme_config
 from components.context_menus import setup_context_menu
+from scipy.spatial import distance
+
+PCA_DATA = pd.read_parquet("/home/jordan/dev/datasets/XFOIL_4D_PCA.parquet")
+ZARR_DB = ft.utils.data.XArrayDataset("/home/jordan/dev/datasets/XFOIL_4D.zarr")
+
+
+@lru_cache(maxsize=2048)
+def surf_lookup(name:str):
+
+    safe_name = name.replace("-", "_").replace(".", "_")
+    if safe_name and safe_name[0] in string.digits:
+        safe_name = f"af_{safe_name}"
+
+    af = getattr(ft.airfoils, safe_name)
+
+    x_af = af.x_coordinates
+    y_af = af.y_coordinates
+
+    raw = af.raw_coordinates
+    x_raw = raw[:, 0]
+    y_raw = raw[:, 1]
+
+    return x_af, y_af, x_raw, y_raw
 
 # --- 1. Data Mocking Layer ---
-mock_df = pd.DataFrame({
-    'name': [f'Airfoil_{i}' for i in range(1400)],
-    'pca_1': np.random.randn(1400),
-    'pca_2': np.random.randn(1400),
-    'pca_3': np.random.randn(1400),
+airfoil_df = pd.DataFrame({
+    'name': PCA_DATA['name'],
+    'pca_1': PCA_DATA['pca_1'],
+    'pca_2': PCA_DATA['pca_2'],
+    'pca_3': PCA_DATA['pca_3'],
     # Mocking single-point aerodynamic values for the manifold color mapping
     'CL': np.random.uniform(0.1, 1.5, 1400),
     'CD': np.random.uniform(0.005, 0.05, 1400),
@@ -21,7 +50,8 @@ mock_df = pd.DataFrame({
 })
 
 latent_state = {
-    'selected_airfoil': mock_df['name'].iloc[0],
+    'selected_airfoil': "naca0024",
+    'sphereize': True,
     'color_metric': 'CL',
     'flight_state': {'alpha': 2.0, 're': 1000000, 'mach': 0.1},
     'show_raw_pts': False,
@@ -33,7 +63,7 @@ latent_state = {
     'opt_objective': 'CL / CD',
     'opt_direction': 'Maximize',
     'constraints': [{'var': 'CD', 'op': '<', 'val': 0.025}],
-    'subspace_opacity': 0.1,  # How faint filtered points appear
+    'subspace_opacity': 0.1,  # How faint filtered points appear'
 }
 
 def get_constraint_mask(df, constraints):
@@ -50,25 +80,90 @@ def get_constraint_mask(df, constraints):
         elif op == '>': mask &= (df[var] > val)
     return mask
 
+def get_representative_indices(re_array, mach_array, flap_array, target_var, num_samples=5):
+    """Finds the Sobol indices that best isolate a sweep of the target_var."""
+    
+    # 1. Min-Max Normalize so distance weighting is equal
+    def normalize(arr):
+        ptp = np.ptp(arr)
+        return (arr - np.min(arr)) / ptp if ptp > 0 else np.zeros_like(arr)
+        
+    n_re = normalize(re_array)
+    n_mach = normalize(mach_array)
+    n_flap = normalize(flap_array)
+    
+    points = np.column_stack((n_re, n_mach, n_flap))
+    
+    # 2. Get nominal (median) values for the "locked" variables
+    med_re, med_mach, med_flap = np.median(n_re), np.median(n_mach), np.median(n_flap)
+    
+    # 3. Generate our ideal targets
+    targets = []
+    sweep = np.linspace(0, 1, num_samples)
+    
+    for val in sweep:
+        if target_var == 're':
+            targets.append([val, med_mach, med_flap])
+        elif target_var == 'mach':
+            targets.append([med_re, val, med_flap])
+        elif target_var == 'flap':  # Assuming you have flap as a UI option
+            targets.append([med_re, med_mach, val])
+        else:
+            # Fallback if z_var isn't a Sobol parameter (e.g. they chose CL as Z)
+            # Just return evenly spaced indices
+            return np.linspace(0, len(re_array)-1, num_samples, dtype=int)
+            
+    # 4. Find the closest actual Sobol sample to each ideal target
+    dists = distance.cdist(targets, points, metric='euclidean')
+    best_indices = np.argmin(dists, axis=1)
+    
+    return best_indices
+
 def create_polar_plot(x_var, y_var, z_var, mode, data, is_dark):
     template = 'plotly_dark' if is_dark else 'plotly_white'
     labels = {'alpha': 'Alpha', 'cl': 'CL', 'cd': 'CD', 'cm': 'CM', 're': 'Re'}
     fig = go.Figure()
 
     # Extract the 2D matrices
-    X, Y, Z_param = data[x_var], data[y_var], data[z_var]
+    X_full = np.asarray(data[x_var])
+    Y_full = np.asarray(data[y_var])
+    Z_full = np.asarray(data[z_var])
+    Alpha_full = np.asarray(data['alpha'])
+
+    sobol_re = np.asarray(data['re'])
+    sobol_re = sobol_re[:, 0] if sobol_re.ndim > 1 else sobol_re
+    
+    sobol_mach = np.asarray(data.get('mach', np.zeros_like(sobol_re)))
+    sobol_mach = sobol_mach[:, 0] if sobol_mach.ndim > 1 else sobol_mach
+    
+    sobol_flap = np.asarray(data.get('flap', np.zeros_like(sobol_re)))
+    sobol_flap = sobol_flap[:, 0] if sobol_flap.ndim > 1 else sobol_flap
+
+    idx = get_representative_indices(sobol_re, sobol_mach, sobol_flap, target_var=z_var, num_samples=5)
+
+    X = X_full[idx]
+    Y = Y_full[idx]
+    Z_param = Z_full[idx]
+
+    alpha_1d = Alpha_full[0] if Alpha_full.ndim > 1 else Alpha_full
+
+    sort_idx = np.argsort(alpha_1d)
+    X_sorted = X[:, sort_idx]
+    Y_sorted = Y[:, sort_idx]
+    Z_sorted = Z_param[:, sort_idx]
 
     if mode == '2D Lines':
         colors = ['#4c02a1', '#9c179e', '#d8576b', '#fd9f3e', '#f0f921'] if is_dark else \
                  ['#93c5fd', '#60a5fa', '#3b82f6', '#2563eb', '#1d4ed8']
         
         # Loop over the rows (which correspond to different values of the Z-parameter)
-        for i in range(X.shape[0]):
-            z_val = Z_param[i, 0]
+        for i in range(X_sorted.shape[0]):
+            z_val = Z_sorted[i, 0]
             c = colors[i % len(colors)]
             fig.add_trace(go.Scatter(
-                x=X[i], y=Y[i], mode='lines+markers', marker_size=3, line_color=c,
-                name=f"{labels[z_var]}={z_val:.1e}"
+                x=X_sorted[i], y=Y_sorted[i], mode='lines', marker_size=3, line_color=c,
+                name=f"{labels[z_var]}={z_val:.1e}",
+                connectgaps=True
             ))
             
         fig.update_layout(
@@ -79,8 +174,9 @@ def create_polar_plot(x_var, y_var, z_var, mode, data, is_dark):
         )
         
     elif mode == '3D Surface':
+        clean_Y = pd.DataFrame(Y_sorted).interpolate(axis=1, limit_direction='both').values
         fig.add_trace(go.Surface(
-            x=X, y=Z_param, z=Y, 
+            x=X_sorted, y=Z_sorted, z=clean_Y, 
             colorscale='Plasma' if is_dark else 'Blues', showscale=False
         ))
         
@@ -99,34 +195,45 @@ def create_polar_plot(x_var, y_var, z_var, mode, data, is_dark):
         
     return fig
 
-def fetch_zarr_data(airfoil_name):
-    # Simulated interpolated points
-    x = np.linspace(0, 1, 128)
-    y = 0.12 * 5 * (0.2969 * np.sqrt(x) - 0.1260 * x - 0.3516 * x**2 + 0.2843 * x**3 - 0.1015 * x**4)
+@lru_cache(maxsize=2048)
+def fetch_af_data(airfoil_name):
+
+    x, y, raw_x, raw_y = surf_lookup(airfoil_name)
     
-    # Simulated noisy raw points (fewer points, slight jitter)
-    raw_x = np.linspace(0, 1, 30)
-    raw_y = 0.12 * 5 * (0.2969 * np.sqrt(raw_x) - 0.1260 * raw_x - 0.3516 * raw_x**2 + 0.2843 * raw_x**3 - 0.1015 * raw_x**4) + np.random.normal(0, 0.002, 30)
+    name_idxs = np.where(ZARR_DB.foil_name == airfoil_name)
+
+    ALPHAS_POS = np.concatenate([
+        np.arange(0, 8, 1.0),       # [0, 1, 2 ... 7]
+        np.arange(8, 15.25, 0.25)   # [8, 8.25 ... 15.0]
+    ])
+
+    # Start just below 0, go down sparsely
+    ALPHAS_NEG = np.arange(-1, -6, -1.0) # [-1, -2, -3, -4, -5]
+
+    # The combined array for Zarr sizing and index matching
+    alpha_1d = np.concatenate([ALPHAS_POS, ALPHAS_NEG])
     
-    # 1D Sweeps
-    alpha_1d = np.linspace(-5, 15, 20)
-    re_1d = np.array([5e5, 1e6, 2e6, 5e6]) # 4 different Re values
+    re_1d = ZARR_DB.Re[name_idxs]
+    
+    cl = ZARR_DB.CL[name_idxs]
+    cd = ZARR_DB.CD[name_idxs]
+    cm = ZARR_DB.CM[name_idxs]
     
     # Create 2D Matrices (Rows = Re, Cols = Alpha)
     A, R = np.meshgrid(alpha_1d, re_1d)
     
     return {
         # Geometry (1D)
-        'x': np.concatenate([x, x[::-1]]), 'y': np.concatenate([y, -y]),
-        'raw_x': np.concatenate([raw_x, raw_x[::-1]]), 'raw_y': np.concatenate([raw_y, -raw_y]),
+        'x': x, 'y': y,
+        'raw_x': raw_x, 'raw_y': raw_y,
         
         # Aerodynamics (2D Matrices)
         'alpha': A, 
         're': R,
         # Mock physics equations that react to both Alpha and Re
-        'cl': 0.1 * A + 0.2 + (np.log10(R) - 6) * 0.05,
-        'cd': 0.005 + 0.0005 * A**2 - (np.log10(R) - 6) * 0.001,
-        'cm': -0.05 - 0.001 * A
+        'cl': cl,
+        'cd': cd,
+        'cm': cm
     }
 
 # --- 2. Event Handlers ---
@@ -152,7 +259,7 @@ def left_inspector_pane():
     canvas_hex = '#000000' if is_dark else '#ffffff'
     
     airfoil_id = latent_state['selected_airfoil']
-    data = fetch_zarr_data(airfoil_id)
+    data = fetch_af_data(airfoil_id)
 
     def update_selection(e):
         latent_state['selected_airfoil'] = e.value
@@ -165,7 +272,7 @@ def left_inspector_pane():
             # The flex-grow min-w-0 wrapper forces flexbox to allow this div to shrink indefinitely
             with ui.element('div').classes('flex-grow min-w-0'):
                 ui.select(
-                    options=mock_df['name'].tolist(),
+                    options=airfoil_df['name'].tolist(),
                     with_input=True, 
                     label='Search Airfoil',
                     value=latent_state['selected_airfoil'],
@@ -367,13 +474,36 @@ def center_manifold_pane():
 
     with ui.column().classes(f"w-full h-full p-4 gap-2 flex-nowrap {canvas_bg}"):
 
+        if latent_state.get('sphereize'):
+            # Proper Sphereizing (Whitening) for PCA:
+            # Equalize the variance along all axes by dividing by their standard deviations
+            x_c = airfoil_df['pca_1'] - airfoil_df['pca_1'].mean()
+            y_c = airfoil_df['pca_2'] - airfoil_df['pca_2'].mean()
+            z_c = airfoil_df['pca_3'] - airfoil_df['pca_3'].mean()
+            
+            airfoil_df['plot_x'] = x_c / x_c.std()
+            airfoil_df['plot_y'] = y_c / y_c.std()
+            airfoil_df['plot_z'] = z_c / z_c.std()
+            
+        else:
+            airfoil_df['plot_x'] = airfoil_df['pca_1']
+            airfoil_df['plot_y'] = airfoil_df['pca_2']
+            airfoil_df['plot_z'] = airfoil_df['pca_3']
+        
+        axis_lim = max(
+            airfoil_df['plot_x'].abs().max(),
+            airfoil_df['plot_y'].abs().max(),
+            airfoil_df['plot_z'].abs().max()) * 1.1
+        
+        # --- 2. FILTERING ---
+
         # MIDDLE: 3D Manifold Plotly Canvas
-        mask = get_constraint_mask(mock_df, latent_state['constraints'])
-        df_in = mock_df[mask]
-        df_out = mock_df[~mask]
+        mask = get_constraint_mask(airfoil_df, latent_state['constraints'])
+        df_in = airfoil_df[mask]
+        df_out = airfoil_df[~mask]
 
         metric = latent_state['color_metric']
-        cmin, cmax = mock_df[metric].min(), mock_df[metric].max()
+        cmin, cmax = airfoil_df[metric].min(), airfoil_df[metric].max()
         colorscale = 'Plasma' if is_dark else 'ice'
         
         scatter_fig = go.Figure()
@@ -381,7 +511,7 @@ def center_manifold_pane():
         # Trace 1: In-Bounds (Full Opacity)
         if len(df_in) > 0:
             scatter_fig.add_trace(go.Scatter3d(
-                x=df_in['pca_1'], y=df_in['pca_2'], z=df_in['pca_3'],
+                x=df_in['plot_x'], y=df_in['plot_y'], z=df_in['plot_z'],
                 text=df_in['name'],
                 mode='markers', opacity=1.0,
                 customdata=np.stack((df_in['name'],), axis=-1),
@@ -389,7 +519,7 @@ def center_manifold_pane():
                 marker=dict(
                     size=3, color=df_in[metric], colorscale=colorscale, cmin=cmin, cmax=cmax,
                     showscale=True, # Show colorbar only on the primary trace
-                    colorbar=dict(title=metric, orientation='h', y=-0.05, thickness=12, len=0.6, title_side='top')
+                    colorbar=dict(orientation='h', y=-0.05, thickness=12, len=1.0, title_side='top')
                 )
             ))
 
@@ -397,7 +527,7 @@ def center_manifold_pane():
         fade_opacity = latent_state.get('subspace_opacity', 0.1)
         if len(df_out) > 0 and fade_opacity > 0:
             scatter_fig.add_trace(go.Scatter3d(
-                x=df_out['pca_1'], y=df_out['pca_2'], z=df_out['pca_3'],
+                x=df_out['plot_x'], y=df_out['plot_y'], z=df_out['plot_z'],
                 text=df_in['name'],
                 mode='markers', opacity=fade_opacity,
                 customdata=np.stack((df_out['name'],), axis=-1),
@@ -405,7 +535,6 @@ def center_manifold_pane():
                 marker=dict(size=3, color=df_out[metric], colorscale=colorscale, cmin=cmin, cmax=cmax, showscale=False)
             ))
 
-        axis_lim = 3.0  # Scale this roughly to max PCA coordinate bounds
         scatter_fig.add_trace(go.Scatter3d(
             x=[-axis_lim, axis_lim, None, 0, 0, None, 0, 0],
             y=[0, 0, None, -axis_lim, axis_lim, None, 0, 0],
@@ -417,14 +546,19 @@ def center_manifold_pane():
         ))
         
         # Plotly Magic: Hide the 3D bounding box, grid, axes, and hover spikes completely
-        clean_axis = dict(showbackground=False, showgrid=False, showline=False, zeroline=False, showticklabels=False, title='', showspikes=False)
+        range_lim = min(axis_lim, 3.0)
+        clean_axis = dict(
+            showbackground=False, showgrid=False, showline=False,
+            zeroline=False, showticklabels=False, title='', showspikes=False,
+            range=[-range_lim, range_lim]
+            )
         
         scatter_fig.update_layout(
             showlegend=False,
-            uirevision='constant',
             template=template, paper_bgcolor=bg_color, plot_bgcolor=bg_color,
             margin=dict(l=0, r=0, t=0, b=0),
-            scene=dict(xaxis=clean_axis, yaxis=clean_axis, zaxis=clean_axis)
+            scene=dict(xaxis=clean_axis, yaxis=clean_axis, zaxis=clean_axis),
+            uirevision=f"camera_{latent_state.get('sphereize')}"
         )
         
         # The flexible void space
@@ -465,8 +599,14 @@ def center_manifold_pane():
                 ui.button(icon='refresh', on_click=update_manifold).props('flat round dense').classes('ml-1 text-primary')
 
             # Right side of bottom bar: Color scale metric selector
-            ui.select(['CL', 'CD', 'CM'], label='Color By', value=latent_state['color_metric'], 
-                      on_change=lambda e: [latent_state.update({'color_metric': e.value}), update_manifold()]).classes('w-32').props('dense')
+            with ui.row().classes('items-center gap-4'):
+                ui.checkbox('Sphereize', value=latent_state['sphereize'], 
+                            on_change=lambda e: [latent_state.update({'sphereize': e.value}), center_manifold_pane.refresh()]) \
+                    .props('dense size="sm"')
+                    
+                ui.select(['CL', 'CD', 'CM'], label='Color By', value=latent_state['color_metric'], 
+                          on_change=lambda e: [latent_state.update({'color_metric': e.value}), update_manifold()]) \
+                    .classes('w-32').props('dense')
 
 # --- 3. Main View Layout ---
 def design_space_ui():
