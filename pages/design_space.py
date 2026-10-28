@@ -52,7 +52,7 @@ airfoil_df = pd.DataFrame({
 latent_state = {
     'selected_airfoil': "naca0024",
     'sphereize': True,
-    'color_metric': 'CL',
+    'color_metric': 'Z-Radius',
     'flight_state': {'alpha': 2.0, 're': 1000000, 'mach': 0.1},
     'show_raw_pts': False,
     'show_interp_pts': False,
@@ -494,6 +494,8 @@ def center_manifold_pane():
             airfoil_df['plot_x'].abs().max(),
             airfoil_df['plot_y'].abs().max(),
             airfoil_df['plot_z'].abs().max()) * 1.1
+
+        airfoil_df['Z-Radius'] = np.sqrt(airfoil_df['plot_x']**2 + airfoil_df['plot_y']**2 + airfoil_df['plot_z']**2)
         
         # --- 2. FILTERING ---
 
@@ -536,9 +538,9 @@ def center_manifold_pane():
             ))
 
         scatter_fig.add_trace(go.Scatter3d(
-            x=[-axis_lim, axis_lim, None, 0, 0, None, 0, 0],
-            y=[0, 0, None, -axis_lim, axis_lim, None, 0, 0],
-            z=[0, 0, None, 0, 0, None, -axis_lim, axis_lim],
+            x=[-3, 3, None, 0, 0, None, 0, 0],
+            y=[0, 0, None, -3, 3, None, 0, 0],
+            z=[0, 0, None, 0, 0, None, -3, 3],
             mode='lines',
             line=dict(color='rgba(128,128,128,0.4)', width=4),
             hoverinfo='none',
@@ -550,7 +552,7 @@ def center_manifold_pane():
         clean_axis = dict(
             showbackground=False, showgrid=False, showline=False,
             zeroline=False, showticklabels=False, title='', showspikes=False,
-            range=[-range_lim, range_lim]
+            range=[-axis_lim, axis_lim]
             )
         
         scatter_fig.update_layout(
@@ -604,7 +606,7 @@ def center_manifold_pane():
                             on_change=lambda e: [latent_state.update({'sphereize': e.value}), center_manifold_pane.refresh()]) \
                     .props('dense size="sm"')
                     
-                ui.select(['CL', 'CD', 'CM'], label='Color By', value=latent_state['color_metric'], 
+                ui.select(['Z-Radius', 'CL', 'CD', 'CM'], label='Color By', value=latent_state['color_metric'], 
                           on_change=lambda e: [latent_state.update({'color_metric': e.value}), update_manifold()]) \
                     .classes('w-32').props('dense')
 
