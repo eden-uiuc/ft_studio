@@ -4,17 +4,25 @@ import plotly.graph_objects as go
 import time
 import string
 
+import fsspec
 import flowtangent as ft
 
 from functools import lru_cache
-from plotly.subplots import make_subplots
 from nicegui import ui
-from utils.state import app_state, theme_config
-from components.context_menus import setup_context_menu
+from utils.state import app_state
 from scipy.spatial import distance
 
-PCA_DATA = pd.read_parquet("/home/jordan/dev/datasets/XFOIL_4D_PCA.parquet")
-ZARR_DB = ft.utils.data.XArrayDataset("/home/jordan/dev/datasets/XFOIL_4D.zarr")
+
+repo_id = "datasets/eden-uiuc/mUIUC-5D"
+
+PCA_DATA = pd.read_parquet(f"hf://{repo_id}/XFOIL_4D_PCA.parquet")
+
+fs = fsspec.filesystem("hf")
+zarr_mapper = fs.get_mapper(f"{repo_id}/XFOIL_4D.zarr")
+
+ZARR_DB = ft.utils.data.XArrayDataset(zarr_mapper)
+# PCA_DATA = pd.read_parquet("/home/jordan/dev/datasets/XFOIL_4D_PCA.parquet")
+# ZARR_DB = ft.utils.data.XArrayDataset("/home/jordan/dev/datasets/XFOIL_4D.zarr")
 
 
 @lru_cache(maxsize=2048)
