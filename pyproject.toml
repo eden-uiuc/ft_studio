@@ -1,5 +1,5 @@
 [project]
-name = "FT Studio"
+name = "ft_studio"
 version = "0.1.0"
 description = "An interactive interface for FlowTangent."
 readme = "README.md"
@@ -9,4 +9,11 @@ dependencies = [
     "plotly",
     "airportsdata",
     "numpy",
+    "pandas",
+    "huggingface_hub",
+    "hf_transfer",
+    "fsspec",
+    "pyarrow",
+    "scipy",
+    "flowtangent @ git+https://github.com/eden-uiuc/flowtangent.git@main"
 ]

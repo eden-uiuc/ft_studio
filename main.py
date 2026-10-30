@@ -90,4 +90,5 @@ def main_app():
     ui.keyboard(on_key=lambda e: perform_redo() if e.key.name == 'y' and e.modifiers.ctrl and e.action.keydown else None)
 
 if __name__ in {"__main__", "__mp_main__"}:
-    ui.run(title="FT Studio", port=8080)
+    # host="0.0.0.0" allows external traffic through the Docker container
+    ui.run(host="0.0.0.0", port=7860, title="FlowTangent Studio")

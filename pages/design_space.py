@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import zarr
+import time
 import string
 
 import flowtangent as ft
@@ -50,7 +50,7 @@ airfoil_df = pd.DataFrame({
 })
 
 latent_state = {
-    'selected_airfoil': "naca0024",
+    'selected_airfoil': "dae41",
     'sphereize': True,
     'color_metric': 'Z-Radius',
     'flight_state': {'alpha': 2.0, 're': 1000000, 'mach': 0.1},
@@ -64,6 +64,9 @@ latent_state = {
     'opt_direction': 'Maximize',
     'constraints': [{'var': 'CD', 'op': '<', 'val': 0.025}],
     'subspace_opacity': 0.1,  # How faint filtered points appear'
+    'history': ["dae41"],
+    'last_click': {'time': 0, 'name': None},
+    'manifold_plot': None,
 }
 
 def get_constraint_mask(df, constraints):
@@ -236,14 +239,140 @@ def fetch_af_data(airfoil_name):
         'cm': cm
     }
 
-# --- 2. Event Handlers ---
-def on_scatter_click(e):
-    if 'points' in e.args:
-        clicked_name = e.args['points'][0]['customdata'][0]
-        latent_state['selected_airfoil'] = clicked_name
-        left_inspector_pane.refresh()
+def update_manifold_plot():
 
-# --- 3. UI Components ---
+    is_dark = app_state.get('is_dark', False)
+    template = 'plotly_dark' if is_dark else 'plotly_white'
+
+    if latent_state.get('sphereize'):
+        # Proper Sphereizing (Whitening) for PCA:
+        # Equalize the variance along all axes by dividing by their standard deviations
+        x_c = airfoil_df['pca_1'] - airfoil_df['pca_1'].mean()
+        y_c = airfoil_df['pca_2'] - airfoil_df['pca_2'].mean()
+        z_c = airfoil_df['pca_3'] - airfoil_df['pca_3'].mean()
+        
+        airfoil_df['plot_x'] = x_c / x_c.std()
+        airfoil_df['plot_y'] = y_c / y_c.std()
+        airfoil_df['plot_z'] = z_c / z_c.std()
+        
+    else:
+        airfoil_df['plot_x'] = airfoil_df['pca_1']
+        airfoil_df['plot_y'] = airfoil_df['pca_2']
+        airfoil_df['plot_z'] = airfoil_df['pca_3']
+    
+    axis_lim = max(
+        airfoil_df['plot_x'].abs().max(),
+        airfoil_df['plot_y'].abs().max(),
+        airfoil_df['plot_z'].abs().max()) * 1.1
+
+    airfoil_df['Z-Radius'] = np.sqrt(airfoil_df['plot_x']**2 + airfoil_df['plot_y']**2 + airfoil_df['plot_z']**2)
+    
+    # --- 2. FILTERING ---
+
+    # MIDDLE: 3D Manifold Plotly Canvas
+    mask = get_constraint_mask(airfoil_df, latent_state['constraints'])
+    df_in = airfoil_df[mask]
+    df_out = airfoil_df[~mask]
+
+    metric = latent_state['color_metric']
+    cmin, cmax = airfoil_df[metric].min(), airfoil_df[metric].max()
+    colorscale = 'Plasma' if is_dark else 'ice'
+    
+    scatter_fig = go.Figure()
+
+    # Trace 1: In-Bounds (Full Opacity)
+    if len(df_in) > 0:
+        scatter_fig.add_trace(go.Scatter3d(
+            x=df_in['plot_x'], y=df_in['plot_y'], z=df_in['plot_z'],
+            text=df_in['name'],
+            mode='markers', opacity=1.0,
+            customdata=np.stack((df_in['name'],), axis=-1),
+            hovertemplate="<b>%{customdata[0]}</b><br>PCA 1: %{x:.2f}<br>PCA 2: %{y:.2f}<br>PCA 3: %{z:.2f}<extra></extra>",
+            marker=dict(
+                size=3, color=df_in[metric], colorscale=colorscale, cmin=cmin, cmax=cmax,
+                showscale=True, # Show colorbar only on the primary trace
+                colorbar=dict(orientation='h', y=-0.05, thickness=12, len=1.0, title_side='top')
+            )
+        ))
+
+    # Trace 2: Out-of-Bounds (Faded)
+    fade_opacity = latent_state.get('subspace_opacity', 0.1)
+    if len(df_out) > 0 and fade_opacity > 0:
+        scatter_fig.add_trace(go.Scatter3d(
+            x=df_out['plot_x'], y=df_out['plot_y'], z=df_out['plot_z'],
+            text=df_in['name'],
+            mode='markers', opacity=fade_opacity,
+            customdata=np.stack((df_out['name'],), axis=-1),
+            hovertemplate="<b>%{customdata[0]}</b> (Out of Bounds)<extra></extra>",
+            marker=dict(size=3, color=df_out[metric], colorscale=colorscale, cmin=cmin, cmax=cmax, showscale=False)
+        ))
+
+    scatter_fig.add_trace(go.Scatter3d(
+        x=[-3, 3, None, 0, 0, None, 0, 0],
+        y=[0, 0, None, -3, 3, None, 0, 0],
+        z=[0, 0, None, 0, 0, None, -3, 3],
+        mode='lines',
+        line=dict(color='rgba(128,128,128,0.4)', width=4),
+        hoverinfo='none',
+        showlegend=False
+    ))
+
+    selected_name = latent_state.get('selected_airfoil')
+    if selected_name:
+        selected_df = airfoil_df[airfoil_df['name'] == selected_name]
+        
+        if not selected_df.empty:
+            highlight_color = 'white' if is_dark else 'black'
+            scatter_fig.add_trace(go.Scatter3d(
+                x=selected_df['plot_x'], 
+                y=selected_df['plot_y'], 
+                z=selected_df['plot_z'],
+                mode='markers',
+                # 'circle-open' creates a hollow ring that acts like a crosshair
+                marker=dict(
+                    size=8, 
+                    symbol='circle-open', 
+                    color=highlight_color, 
+                    line=dict(color=highlight_color, width=4)
+                ),
+                hoverinfo='skip', # Let the underlying point handle the hover text
+                showlegend=False
+            ))
+    
+    # Plotly Magic: Hide the 3D bounding box, grid, axes, and hover spikes completely
+    clean_axis = dict(
+        showbackground=False, showgrid=False, showline=False,
+        zeroline=False, showticklabels=False, title='', showspikes=False,
+        range=[-axis_lim, axis_lim]
+        )
+
+    scatter_fig.update_layout(
+        showlegend=False,
+        template=template, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=0, r=0, t=0, b=0),
+        scene=dict(xaxis=clean_axis, yaxis=clean_axis, zaxis=clean_axis),
+        uirevision=f"camera_{latent_state.get('sphereize')}"
+    )
+
+    latent_state['manifold_plot'].figure = scatter_fig
+    latent_state['manifold_plot'].update()
+
+def update_selection(e, update_history=True):
+    new_name = e.value
+    latent_state['selected_airfoil'] = new_name
+
+    if update_history:
+        # Manage History (Keep last 10, move recent to front)
+        hist = latent_state['history']
+        if new_name in hist:
+            hist.remove(new_name)
+        hist.insert(0, new_name)
+        latent_state['history'] = hist[:10]
+    
+    left_inspector_pane.refresh()
+    update_manifold_plot()
+
+# --- 2. UI Components ---
 
 @ui.refreshable
 def left_inspector_pane():
@@ -261,9 +390,6 @@ def left_inspector_pane():
     airfoil_id = latent_state['selected_airfoil']
     data = fetch_af_data(airfoil_id)
 
-    def update_selection(e):
-        latent_state['selected_airfoil'] = e.value
-        left_inspector_pane.refresh() # Only refresh the inspector to show the new airfoil!
     
     with ui.column().classes(f'w-full h-full flex-nowrap p-4 border-r {sidebar_bg} {sidebar_border} {text_color}'):
         # ui.label(f"{airfoil_id}").classes('text-xl font-bold border-b border-gray-600/50 w-full pb-2 shrink-0')
@@ -310,17 +436,30 @@ def left_inspector_pane():
         )
         
         # Wrap plot in a shadow container for the floating box effect
-        with ui.element('div').classes('w-full rounded-none overflow-hidden shadow-lg border border-gray-600/20'):
+        with ui.element('div').classes('w-full min-h-[100px] gap-0 rounded-none overflow-hidden shadow-lg border border-gray-600/20'):
             ui.plotly(geom_fig).classes('w-full shrink-0')
-            
+
         # Checkbox Row
-        with ui.row().classes('w-full items-center justify-center gap-4 -mt-4 mb-2'):
+        with ui.row().classes('w-full items-center justify-center gap-4 -mt-4 mb-0'):
             ui.checkbox('Raw Pts.', value=latent_state['show_raw_pts'], 
                         on_change=lambda e: [latent_state.update({'show_raw_pts': e.value}), left_inspector_pane.refresh()]).props('dense size="sm"')
             ui.checkbox('Interp. Pts.', value=latent_state['show_interp_pts'],
                         on_change=lambda e: [latent_state.update({'show_interp_pts': e.value}), left_inspector_pane.refresh()]).props('dense size="sm"')
+        if latent_state['history']:
+            safe_history_options = latent_state['history'].copy()
+            if latent_state['selected_airfoil'] not in safe_history_options:
+                safe_history_options.insert(0, latent_state['selected_airfoil'])
 
-        # ui.separator().classes('my-4 opacity-50')
+            with ui.row().classes('w-full items-center justify-between border-b border-gray-600/50 pb-2 shrink-0 flex-nowrap gap-0'):
+                
+                with ui.expansion('Recent History', icon='history').classes('w-full rounded border border-gray-600/50 mt-2'):
+                    ui.select(
+                        safe_history_options, 
+                        # label='Recent Airfoils', 
+                        value=latent_state['selected_airfoil'],
+                        on_change=lambda e: update_selection(e, False)
+                    ).classes('w-full -mt-2').props('dense options-dense')
+            # ui.separator().classes('my-4 opacity-50')
         ui.label(f"Polar Data").classes('text-lg font-bold border-b border-gray-600/50 w-full pb-2 shrink-0')
         
         # --- Dynamic Polars ---
@@ -391,7 +530,7 @@ def constraint_builder_ui():
                 .classes('flex-1').props('size="sm"')
             
             ui.button('Apply', icon='check_circle', color='primary', 
-                      on_click=center_manifold_pane.refresh) \
+                      on_click=update_manifold_plot) \
                 .classes('flex-1').props('size="sm"')
 
 
@@ -454,134 +593,39 @@ def right_tools_pane():
                 ui.button(icon='send', color='primary').props('round flat dense').classes('ml-2')
 
 
-# --- 4. Main View Layout ---
-@ui.refreshable
 def center_manifold_pane():
     is_dark = app_state.get('is_dark', False)
-    template = 'plotly_dark' if is_dark else 'plotly_white'
     canvas_bg = 'bg-black text-gray-200' if is_dark else 'bg-white text-gray-800'
-    bg_color = 'rgba(0,0,0,0)'
-
-    # Handlers for updates
-    def update_selection(e):
-        latent_state['selected_airfoil'] = e.value
-        left_inspector_pane.refresh() 
-
-    def update_manifold():
-        # In a real app, this would query your dataset for the new Alpha/Re/Mach values 
-        # before refreshing the plot to update the colors.
-        center_manifold_pane.refresh()
+    
 
     with ui.column().classes(f"w-full h-full p-4 gap-2 flex-nowrap {canvas_bg}"):
-
-        if latent_state.get('sphereize'):
-            # Proper Sphereizing (Whitening) for PCA:
-            # Equalize the variance along all axes by dividing by their standard deviations
-            x_c = airfoil_df['pca_1'] - airfoil_df['pca_1'].mean()
-            y_c = airfoil_df['pca_2'] - airfoil_df['pca_2'].mean()
-            z_c = airfoil_df['pca_3'] - airfoil_df['pca_3'].mean()
-            
-            airfoil_df['plot_x'] = x_c / x_c.std()
-            airfoil_df['plot_y'] = y_c / y_c.std()
-            airfoil_df['plot_z'] = z_c / z_c.std()
-            
-        else:
-            airfoil_df['plot_x'] = airfoil_df['pca_1']
-            airfoil_df['plot_y'] = airfoil_df['pca_2']
-            airfoil_df['plot_z'] = airfoil_df['pca_3']
-        
-        axis_lim = max(
-            airfoil_df['plot_x'].abs().max(),
-            airfoil_df['plot_y'].abs().max(),
-            airfoil_df['plot_z'].abs().max()) * 1.1
-
-        airfoil_df['Z-Radius'] = np.sqrt(airfoil_df['plot_x']**2 + airfoil_df['plot_y']**2 + airfoil_df['plot_z']**2)
-        
-        # --- 2. FILTERING ---
-
-        # MIDDLE: 3D Manifold Plotly Canvas
-        mask = get_constraint_mask(airfoil_df, latent_state['constraints'])
-        df_in = airfoil_df[mask]
-        df_out = airfoil_df[~mask]
-
-        metric = latent_state['color_metric']
-        cmin, cmax = airfoil_df[metric].min(), airfoil_df[metric].max()
-        colorscale = 'Plasma' if is_dark else 'ice'
-        
-        scatter_fig = go.Figure()
-
-        # Trace 1: In-Bounds (Full Opacity)
-        if len(df_in) > 0:
-            scatter_fig.add_trace(go.Scatter3d(
-                x=df_in['plot_x'], y=df_in['plot_y'], z=df_in['plot_z'],
-                text=df_in['name'],
-                mode='markers', opacity=1.0,
-                customdata=np.stack((df_in['name'],), axis=-1),
-                hovertemplate="<b>%{customdata[0]}</b><br>PCA 1: %{x:.2f}<br>PCA 2: %{y:.2f}<br>PCA 3: %{z:.2f}<extra></extra>",
-                marker=dict(
-                    size=3, color=df_in[metric], colorscale=colorscale, cmin=cmin, cmax=cmax,
-                    showscale=True, # Show colorbar only on the primary trace
-                    colorbar=dict(orientation='h', y=-0.05, thickness=12, len=1.0, title_side='top')
-                )
-            ))
-
-        # Trace 2: Out-of-Bounds (Faded)
-        fade_opacity = latent_state.get('subspace_opacity', 0.1)
-        if len(df_out) > 0 and fade_opacity > 0:
-            scatter_fig.add_trace(go.Scatter3d(
-                x=df_out['plot_x'], y=df_out['plot_y'], z=df_out['plot_z'],
-                text=df_in['name'],
-                mode='markers', opacity=fade_opacity,
-                customdata=np.stack((df_out['name'],), axis=-1),
-                hovertemplate="<b>%{customdata[0]}</b> (Out of Bounds)<extra></extra>",
-                marker=dict(size=3, color=df_out[metric], colorscale=colorscale, cmin=cmin, cmax=cmax, showscale=False)
-            ))
-
-        scatter_fig.add_trace(go.Scatter3d(
-            x=[-3, 3, None, 0, 0, None, 0, 0],
-            y=[0, 0, None, -3, 3, None, 0, 0],
-            z=[0, 0, None, 0, 0, None, -3, 3],
-            mode='lines',
-            line=dict(color='rgba(128,128,128,0.4)', width=4),
-            hoverinfo='none',
-            showlegend=False
-        ))
-        
-        # Plotly Magic: Hide the 3D bounding box, grid, axes, and hover spikes completely
-        range_lim = min(axis_lim, 3.0)
-        clean_axis = dict(
-            showbackground=False, showgrid=False, showline=False,
-            zeroline=False, showticklabels=False, title='', showspikes=False,
-            range=[-axis_lim, axis_lim]
-            )
-        
-        scatter_fig.update_layout(
-            showlegend=False,
-            template=template, paper_bgcolor=bg_color, plot_bgcolor=bg_color,
-            margin=dict(l=0, r=0, t=0, b=0),
-            scene=dict(xaxis=clean_axis, yaxis=clean_axis, zaxis=clean_axis),
-            uirevision=f"camera_{latent_state.get('sphereize')}"
-        )
         
         # The flexible void space
         with ui.element('div').classes('w-full flex-grow relative'):
-            plot = ui.plotly(scatter_fig).classes('w-full h-full absolute inset-0')
+            latent_state['manifold_plot'] = ui.plotly(go.Figure()).classes('w-full h-full absolute inset-0')
+            update_manifold_plot()
             
             # Safe click handler
             def handle_click(e):
                 points = e.args.get('points', [])
                 if not points: 
-                    return # Background click, do nothing
+                    return
                     
                 pt = points[0]
-                # Safely try customdata first, fallback to text
                 clicked_name = pt.get('customdata', [None])[0] or pt.get('text')
                 
                 if clicked_name:
-                    # Trigger the existing update_selection function safely
-                    update_selection(type('obj', (object,), {'value': clicked_name}))
+                    now = time.time()
+                    last = latent_state.get('last_click', {'time': 0, 'name': None})
+                    
+                    # Trigger only if the same point is clicked twice within 500ms
+                    if clicked_name == last['name'] and (now - last['time']) < 0.5:
+                        update_selection(type('obj', (object,), {'value': clicked_name}))
+                        latent_state['last_click'] = {'time': 0, 'name': None} # Reset
+                    else:
+                        latent_state['last_click'] = {'time': now, 'name': clicked_name}
 
-            plot.on('plotly_click', handle_click)
+            latent_state['manifold_plot'].on('plotly_click', handle_click)
 
         # BOTTOM: Flight State & Metric Controls
         # Pinned to the bottom, horizontal layout
@@ -598,16 +642,16 @@ def center_manifold_pane():
                           on_change=lambda e: latent_state['flight_state'].update({'mach': e.value})).classes('w-24').props('dense')
                 
                 # Apply button to prevent refreshing the plot on every single keystroke
-                ui.button(icon='refresh', on_click=update_manifold).props('flat round dense').classes('ml-1 text-primary')
+                ui.button(icon='refresh', on_click=update_manifold_plot).props('flat round dense').classes('ml-1 text-primary')
 
             # Right side of bottom bar: Color scale metric selector
             with ui.row().classes('items-center gap-4'):
                 ui.checkbox('Sphereize', value=latent_state['sphereize'], 
-                            on_change=lambda e: [latent_state.update({'sphereize': e.value}), center_manifold_pane.refresh()]) \
+                            on_change=lambda e: [latent_state.update({'sphereize': e.value}), update_manifold_plot()]) \
                     .props('dense size="sm"')
                     
                 ui.select(['Z-Radius', 'CL', 'CD', 'CM'], label='Color By', value=latent_state['color_metric'], 
-                          on_change=lambda e: [latent_state.update({'color_metric': e.value}), update_manifold()]) \
+                          on_change=lambda e: [latent_state.update({'color_metric': e.value}), update_manifold_plot()]) \
                     .classes('w-32').props('dense')
 
 # --- 3. Main View Layout ---
